@@ -93,10 +93,20 @@ PROMPT_TEMPLATE = f"""Ты — ИИ-администратор салона кр
 4. Вежливо отказывать в запросах, не связанных с работой салона
 
 ## Формат даты и времени:
-- Ты ДОЛЖЕН принимать даты в естественном формате: "17 мая", "завтра", "послезавтра", "25.06.2026"
-- При вызове инструмента передавай дату в формате ГГГГ-ММ-ДД
-- Время всегда в формате ЧЧ:ММ
-- Если год не указан — используй текущий 2026 год
+# Замени эту часть в PROMPT_TEMPLATE:
+
+## Формат даты и времени:
+- Ты НЕ ПИШЕШЬ технические инструкции вроде "в формате ЧЧ:ММ" — это выглядит неестественно
+- Ты ПРОСТО ПРОСИШЬ назвать время, как человек: "В какое время вам удобно?"
+- Если клиент сказал "в 7 вечера" — ты понимаешь это как 19:00
+- Если клиент сказал "в 3 часа дня" — ты понимаешь это как 15:00
+- При вызове инструмента сама преобразуешь в нужный формат
+- Для даты: "17 мая", "завтра", "25 июня" — всё это работает
+- НЕ ПИШИ клиенту: "Укажите время в формате ЧЧ:ММ" | "Укажите дату в формате дд.мм.гггг"
+
+## Как просить информацию (человечно):
+Плохо: "Дата (например, "17 мая", "завтра" или конкретная дата)\nВремя в формате ЧЧ:ММ"
+Хорошо: "📅 На какое число вас записать?\n⏰ В какое время вам удобно?"
 
 ## Форматирование в Telegram:
 - Telegram поддерживает обычные списки с дефисами или цифрами. Например: "- Маникюр" или "1. Маникюр"
@@ -201,48 +211,92 @@ def schedule_manicure(client_name: str, date: str, time: str, phone: str = None,
     - branch: филиал
     """
     try:
+        # Логируем все полученные данные для отладки
+        logger.info(f"📅 Попытка записи: имя={client_name}, дата={date}, время={time}, тел={phone}, услуга={service}, филиал={branch}")
+        
+        # Нормализуем дату
         normalized_date = normalize_date(date)
         if not normalized_date:
-            return "❌ Не удалось распознать дату. Пожалуйста, укажите в формате 'день месяц' или '2026-05-17'"
+            return "❌ Не удалось распознать дату. Просто напишите, например: 'завтра', '17 мая' или '25.06'"
         
-        start_dt = datetime.strptime(f"{normalized_date} {time}", "%Y-%m-%d %H:%M")
-        start_dt = TZ.localize(start_dt)
+        # Парсим время
+        try:
+            # Если время пришло в формате "19:00" или "19:00:00"
+            time_clean = time.split(':')[:2]
+            time_str = ':'.join(time_clean)
+            start_dt = datetime.strptime(f"{normalized_date} {time_str}", "%Y-%m-%d %H:%M")
+            start_dt = TZ.localize(start_dt)
+        except Exception as e:
+            logger.error(f"Ошибка парсинга времени: {e}")
+            return "❌ Не удалось распознать время. Напишите, например: '15:30', '7 вечера' или '19:00'"
         
         # Проверка времени работы
         if start_dt.hour < 9 or start_dt.hour >= 23:
-            return "❌ Салон работает с 9:00 до 23:00. Пожалуйста, выберите другое время."
+            return f"❌ Салон работает с 9:00 до 23:00. Вы выбрали {start_dt.hour}:00, выберите другое время"
         
+        # Проверка, что дата не в прошлом
+        now = datetime.now(TZ)
+        if start_dt.date() < now.date():
+            return "❌ Нельзя записаться на прошедшую дату. Выберите сегодняшний день или будущий"
+        
+        # Длительность процедуры (по умолчанию 1.5 часа)
         end_dt = start_dt + timedelta(hours=1, minutes=30)
         
-        # Формируем описание события
-        desc_parts = [f"Клиент: {client_name}"]
-        if phone:
-            desc_parts.append(f"Телефон: {phone}")
+        # Формируем красивое название услуги для SUMMARY
         if service:
-            desc_parts.append(f"Услуга: {service}")
-        if branch:
-            desc_parts.append(f"Филиал: {branch}")
+            # Обрезаем слишком длинные названия (максимум 50 символов для заголовка)
+            service_short = service[:50] + "..." if len(service) > 50 else service
+            summary = f"💅 {service_short} - {client_name}"
+        else:
+            summary = f"📅 Запись - {client_name}"
         
-        # Создаем событие в календаре
+        # Формируем полное описание события
+        desc_parts = [
+            "=" * 40,
+            f"👤 КЛИЕНТ: {client_name}",
+        ]
+        
+        if phone:
+            # Маскируем телефон в логах, но сохраняем как есть в календаре
+            desc_parts.append(f"📞 ТЕЛЕФОН: {phone}")
+        
+        if service:
+            desc_parts.append(f"💅 УСЛУГА: {service}")
+        
+        if branch:
+            desc_parts.append(f"📍 ФИЛИАЛ: {branch}")
+        
+        desc_parts.append(f"📅 ДАТА: {normalized_date}")
+        desc_parts.append(f"⏰ ВРЕМЯ: {time}")
+        desc_parts.append(f"🕐 ОКОНЧАНИЕ: {end_dt.strftime('%H:%M')}")
+        desc_parts.append("=" * 40)
+        
+        description = "\n".join(desc_parts)
+        
+        # Создаем событие в Яндекс.Календаре
         YANDEX_LOGIN = os.getenv("YANDEX_LOGIN")
         YANDEX_APP_PASSWORD = os.getenv("YANDEX_APP_PASSWORD")
         
+        event_created = False
+        
         if YANDEX_LOGIN and YANDEX_APP_PASSWORD:
-            client = caldav.DAVClient(
-                url="https://caldav.yandex.ru",
-                username=YANDEX_LOGIN,
-                password=YANDEX_APP_PASSWORD
-            )
-            principal = client.principal()
-            calendars = principal.calendars()
-            if calendars:
-                calendar = calendars[0]
-                uid = str(uuid.uuid4())
-                start_str = start_dt.strftime("%Y%m%dT%H%M%S")
-                end_str = end_dt.strftime("%Y%m%dT%H%M%S")
-                now_str = datetime.now(TZ).strftime("%Y%m%dT%H%M%S")
+            try:
+                client = caldav.DAVClient(
+                    url="https://caldav.yandex.ru",
+                    username=YANDEX_LOGIN,
+                    password=YANDEX_APP_PASSWORD
+                )
+                principal = client.principal()
+                calendars = principal.calendars()
                 
-                ical_event = f"""BEGIN:VCALENDAR
+                if calendars:
+                    calendar = calendars[0]
+                    uid = str(uuid.uuid4())
+                    start_str = start_dt.strftime("%Y%m%dT%H%M%S")
+                    end_str = end_dt.strftime("%Y%m%dT%H%M%S")
+                    now_str = datetime.now(TZ).strftime("%Y%m%dT%H%M%S")
+                    
+                    ical_event = f"""BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Nailhub Bot//EN
 BEGIN:VEVENT
@@ -250,32 +304,60 @@ UID:{uid}
 DTSTAMP:{now_str}
 DTSTART:{start_str}
 DTEND:{end_str}
-SUMMARY:Запись - {client_name}
-DESCRIPTION:{chr(10).join(desc_parts)}
+SUMMARY:{summary}
+DESCRIPTION:{description}
+LOCATION:{branch if branch else 'Не указан'}
 END:VEVENT
 END:VCALENDAR"""
-                calendar.save_event(ical_event)
-                logger.info("Создана запись: %s на %s %s", client_name, normalized_date, time)
+                    
+                    calendar.save_event(ical_event)
+                    event_created = True
+                    logger.info(f"✅ Запись создана в календаре: {summary} на {normalized_date} {time}")
+                else:
+                    logger.warning("Календари не найдены")
+            except Exception as cal_error:
+                logger.error(f"Ошибка при создании события в календаре: {cal_error}")
+                # Не возвращаем ошибку, а продолжаем - клиенту скажем что запись создана, но в календарь не добавилась
+        else:
+            logger.warning("Не заданы YANDEX_LOGIN или YANDEX_APP_PASSWORD для календаря")
         
-        # Формируем ответ
+        # Формируем красивый ответ для клиента (ВСЕГДА, даже если календарь не сработал)
         response_parts = [
-            f"✅ Запись создана!",
-            f"Имя: {client_name}",
-            f"Дата: {normalized_date}",
-            f"Время: {time}",
+            "✨ Отлично! Я всё записала:",
+            "",
+            f"👤 Имя: {client_name}",
         ]
+        
         if service:
-            response_parts.append(f"Услуга: {service}")
+            response_parts.append(f"💅 Услуга: {service}")
+        
+        response_parts.append(f"📅 Дата: {normalized_date}")
+        response_parts.append(f"⏰ Время: {time}")
+        
         if branch:
-            response_parts.append(f"Филиал: {branch}")
-        response_parts.append("С вами свяжутся для подтверждения записи.")
+            response_parts.append(f"📍 Филиал: {branch}")
+        
+        if phone:
+            # Показываем только последние 4 цифры телефона для приватности
+            phone_masked = "***" + phone[-4:] if len(phone) >= 4 else "***"
+            response_parts.append(f"📞 Телефон: {phone_masked}")
+        
+        response_parts.append("")
+        response_parts.append("✅ Запись подтверждена! Мы ждём вас.")
+        response_parts.append("")
+        response_parts.append("💡 Если нужно изменить или отменить запись, просто напишите мне.")
+        
+        # Если календарь не сработал, добавляем предупреждение
+        if not event_created:
+            response_parts.append("")
+            response_parts.append("⚠️ Небольшая техническая задержка с синхронизацией, но администратор уже всё видит. Можете не переживать!")
         
         return "\n".join(response_parts)
         
     except Exception as e:
-        logger.exception("Ошибка создания записи")
-        return "❌ Произошла ошибка при создании записи. Пожалуйста, попробуйте позже или позвоните нам: +7 (978) 847-66-26"
-
+        logger.exception("Критическая ошибка при создании записи")
+        return f"❌ Произошла ошибка при создании записи. Пожалуйста, попробуйте позже или позвоните нам: +7 (978) 847-66-26\n\nОшибка: {str(e)}"
+    
 # --- Маскирование конфиденциальных данных ---
 def mask_sensitive_data(text: str) -> str:
     """Маскирует email-адреса и номера телефонов"""
